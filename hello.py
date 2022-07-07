@@ -1,82 +1,217 @@
-from datetime import datetime, timedelta
-from textwrap import dedent
+import logging
+import os
 
-# The DAG object; we'll need this to instantiate a DAG
+import pendulum
+
 from airflow import DAG
+from airflow.configuration import conf
+from airflow.decorators import task
+from airflow.example_dags.libs.helper import print_stuff
 
-# Operators; we need this to operate!
-from airflow.operators.bash import BashOperator
-with DAG(
-    'tutorial',
-    # These args will get passed on to each operator
-    # You can override them on a per-task basis during operator initialization
-    default_args={
-        'depends_on_past': False,
-        'email': ['airflow@example.com'],
-        'email_on_failure': False,
-        'email_on_retry': False,
-        'retries': 1,
-        'retry_delay': timedelta(minutes=5),
-        # 'queue': 'bash_queue',
-        # 'pool': 'backfill',
-        # 'priority_weight': 10,
-        # 'end_date': datetime(2016, 1, 1),
-        # 'wait_for_downstream': False,
-        # 'sla': timedelta(hours=2),
-        # 'execution_timeout': timedelta(seconds=300),
-        # 'on_failure_callback': some_function,
-        # 'on_success_callback': some_other_function,
-        # 'on_retry_callback': another_function,
-        # 'sla_miss_callback': yet_another_function,
-        # 'trigger_rule': 'all_success'
-    },
-    description='A simple tutorial DAG',
-    schedule_interval=timedelta(days=1),
-    start_date=datetime(2021, 1, 1),
-    catchup=False,
-    tags=['example'],
-) as dag:
+log = logging.getLogger(__name__)
 
-    # t1, t2 and t3 are examples of tasks created by instantiating operators
-    t1 = BashOperator(
-        task_id='print_date',
-        bash_command='date',
+worker_container_repository = conf.get('kubernetes', 'worker_container_repository')
+worker_container_tag = conf.get('kubernetes', 'worker_container_tag')
+
+try:
+    from kubernetes.client import models as k8s
+except ImportError:
+    log.warning(
+        "The example_kubernetes_executor example DAG requires the kubernetes provider."
+        " Please install it with: pip install apache-airflow[cncf.kubernetes]"
     )
+    k8s = None
 
-    t2 = BashOperator(
-        task_id='sleep',
-        depends_on_past=False,
-        bash_command='sleep 5',
-        retries=3,
-    )
-    t1.doc_md = dedent(
-        """\
-    #### Task Documentation
-    You can document your task using the attributes `doc_md` (markdown),
-    `doc` (plain text), `doc_rst`, `doc_json`, `doc_yaml` which gets
-    rendered in the UI's Task Instance Details page.
-    ![img](http://montcs.bloomu.edu/~bobmon/Semesters/2012-01/491/import%20soul.png)
 
-    """
-    )
+if k8s:
+    with DAG(
+        dag_id='example_kubernetes_executor',
+        schedule_interval=None,
+        start_date=pendulum.datetime(2021, 1, 1, tz="UTC"),
+        catchup=False,
+        tags=['example3'],
+    ) as dag:
+        # You can use annotations on your kubernetes pods!
+        start_task_executor_config = {
+            "pod_override": k8s.V1Pod(metadata=k8s.V1ObjectMeta(annotations={"test": "annotation"}))
+        }
 
-    dag.doc_md = __doc__  # providing that you have a docstring at the beginning of the DAG
-    dag.doc_md = """
-    This is a documentation placed anywhere
-    """  # otherwise, type it like this
-    templated_command = dedent(
-        """
-    {% for i in range(5) %}
-        echo "{{ ds }}"
-        echo "{{ macros.ds_add(ds, 7)}}"
-    {% endfor %}
-    """
-    )
+        @task(executor_config=start_task_executor_config)
+        def start_task():
+            print_stuff()
 
-    t3 = BashOperator(
-        task_id='templated',
-        depends_on_past=False,
-        bash_command=templated_command,
-    )
+        # [START task_with_volume]
+        executor_config_volume_mount = {
+            "pod_override": k8s.V1Pod(
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base",
+                            volume_mounts=[
+                                k8s.V1VolumeMount(mount_path="/foo/", name="example-kubernetes-test-volume")
+                            ],
+                        )
+                    ],
+                    volumes=[
+                        k8s.V1Volume(
+                            name="example-kubernetes-test-volume",
+                            host_path=k8s.V1HostPathVolumeSource(path="/tmp/"),
+                        )
+                    ],
+                )
+            ),
+        }
 
-    t1 >> [t2, t3]
+        @task(executor_config=executor_config_volume_mount)
+        def test_volume_mount():
+            """
+            Tests whether the volume has been mounted.
+            """
+
+            with open('/foo/volume_mount_test.txt', 'w') as foo:
+                foo.write('Hello')
+
+            return_code = os.system("cat /foo/volume_mount_test.txt")
+            if return_code != 0:
+                raise ValueError(f"Error when checking volume mount. Return code {return_code}")
+
+        volume_task = test_volume_mount()
+        # [END task_with_volume]
+
+        # [START task_with_sidecar]
+        executor_config_sidecar = {
+            "pod_override": k8s.V1Pod(
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base",
+                            volume_mounts=[k8s.V1VolumeMount(mount_path="/shared/", name="shared-empty-dir")],
+                        ),
+                        k8s.V1Container(
+                            name="sidecar",
+                            image="ubuntu",
+                            args=["echo \"retrieved from mount\" > /shared/test.txt"],
+                            command=["bash", "-cx"],
+                            volume_mounts=[k8s.V1VolumeMount(mount_path="/shared/", name="shared-empty-dir")],
+                        ),
+                    ],
+                    volumes=[
+                        k8s.V1Volume(name="shared-empty-dir", empty_dir=k8s.V1EmptyDirVolumeSource()),
+                    ],
+                )
+            ),
+        }
+
+        @task(executor_config=executor_config_sidecar)
+        def test_sharedvolume_mount():
+            """
+            Tests whether the volume has been mounted.
+            """
+            for i in range(5):
+                try:
+                    return_code = os.system("cat /shared/test.txt")
+                    if return_code != 0:
+                        raise ValueError(f"Error when checking volume mount. Return code {return_code}")
+                except ValueError as e:
+                    if i > 4:
+                        raise e
+
+        sidecar_task = test_sharedvolume_mount()
+        # [END task_with_sidecar]
+
+        # You can add labels to pods
+        executor_config_non_root = {
+            "pod_override": k8s.V1Pod(metadata=k8s.V1ObjectMeta(labels={"release": "stable"}))
+        }
+
+        @task(executor_config=executor_config_non_root)
+        def non_root_task():
+            print_stuff()
+
+        third_task = non_root_task()
+
+        executor_config_other_ns = {
+            "pod_override": k8s.V1Pod(
+                metadata=k8s.V1ObjectMeta(namespace="test-namespace", labels={'release': 'stable'})
+            )
+        }
+
+        @task(executor_config=executor_config_other_ns)
+        def other_namespace_task():
+            print_stuff()
+
+        other_ns_task = other_namespace_task()
+
+        # You can also change the base image, here we used the worker image for demonstration.
+        # Note that the image must have the same configuration as the
+        # worker image. Could be that you want to run this task in a special docker image that has a zip
+        # library built-in. You build the special docker image on top your worker image.
+        kube_exec_config_special = {
+            "pod_override": k8s.V1Pod(
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base", image=f"{worker_container_repository}:{worker_container_tag}"
+                        ),
+                    ]
+                )
+            )
+        }
+
+        @task(executor_config=kube_exec_config_special)
+        def base_image_override_task():
+            print_stuff()
+
+        base_image_task = base_image_override_task()
+
+        # Use k8s_client.V1Affinity to define node affinity
+        k8s_affinity = k8s.V1Affinity(
+            pod_anti_affinity=k8s.V1PodAntiAffinity(
+                required_during_scheduling_ignored_during_execution=[
+                    k8s.V1PodAffinityTerm(
+                        label_selector=k8s.V1LabelSelector(
+                            match_expressions=[
+                                k8s.V1LabelSelectorRequirement(key='app', operator='In', values=['airflow'])
+                            ]
+                        ),
+                        topology_key='kubernetes.io/hostname',
+                    )
+                ]
+            )
+        )
+
+        # Use k8s_client.V1Toleration to define node tolerations
+        k8s_tolerations = [k8s.V1Toleration(key='dedicated', operator='Equal', value='airflow')]
+
+        # Use k8s_client.V1ResourceRequirements to define resource limits
+        k8s_resource_requirements = k8s.V1ResourceRequirements(
+            requests={'memory': '512Mi'}, limits={'memory': '512Mi'}
+        )
+
+        kube_exec_config_resource_limits = {
+            "pod_override": k8s.V1Pod(
+                spec=k8s.V1PodSpec(
+                    containers=[
+                        k8s.V1Container(
+                            name="base",
+                            resources=k8s_resource_requirements,
+                        )
+                    ],
+                    affinity=k8s_affinity,
+                    tolerations=k8s_tolerations,
+                )
+            )
+        }
+
+        @task(executor_config=kube_exec_config_resource_limits)
+        def task_with_resource_limits():
+            print_stuff()
+
+        four_task = task_with_resource_limits()
+
+        (
+            start_task()
+            >> [volume_task, other_ns_task, sidecar_task]
+            >> third_task
+            >> [base_image_task, four_task]
+        )
