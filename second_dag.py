@@ -26,10 +26,10 @@ if k8s:
         tags=['example3'],
     ) as dag:
 
-    echo_task = BashOperator(task_id="echo",
-                            bash_command='echo "this is hello message"')
+        echo_task = BashOperator(task_id="echo",
+                                bash_command='echo "this is hello message"')
 
-    recv_task = BashOperator(task_id="recv",
-                            bash_command='echo "task recieved"')
+        recv_task = BashOperator(task_id="recv",
+                                bash_command='echo "task recieved"')
 
 echo_task >> recv_task
